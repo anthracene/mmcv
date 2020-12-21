@@ -1,5 +1,6 @@
 # Copyright (c) Open-MMLab. All rights reserved.
 import ast
+import itertools
 import os.path as osp
 import platform
 import shutil
@@ -22,6 +23,7 @@ else:
 
 BASE_KEY = '_base_'
 DELETE_KEY = '_delete_'
+MERGE_KEY = '_merge_'
 RESERVED_KEYS = ['filename', 'text', 'pretty_text']
 
 
@@ -190,58 +192,35 @@ class Config:
         return cfg_dict, cfg_text
 
     @staticmethod
-    def _merge_a_into_b(a, b, allow_list_keys=False):
-        """merge dict ``a`` into dict ``b`` (non-inplace).
-
-        Values in ``a`` will overwrite ``b``. ``b`` is copied first to avoid
-        in-place modifications.
-
-        Args:
-            a (dict): The source dict to be merged into ``b``.
-            b (dict): The origin dict to be fetch keys from ``a``.
-            allow_list_keys (bool): If True, int string keys (e.g. '0', '1')
-              are allowed in source ``a`` and will replace the element of the
-              corresponding index in b if b is a list. Default: False.
-
-        Returns:
-            dict: The modified dict of ``b`` using ``a``.
-
-        Examples:
-            # Normally merge a into b.
-            >>> Config._merge_a_into_b(
-            ...     dict(obj=dict(a=2)), dict(obj=dict(a=1)))
-            {'obj': {'a': 2}}
-
-            # Delete b first and merge a into b.
-            >>> Config._merge_a_into_b(
-            ...     dict(obj=dict(_delete_=True, a=2)), dict(obj=dict(a=1)))
-            {'obj': {'a': 2}}
-
-            # b is a list
-            >>> Config._merge_a_into_b(
-            ...     {'0': dict(a=2)}, [dict(a=1), dict(b=2)], True)
-            [{'a': 2}, {'b': 2}]
-        """
-        b = b.copy()
-        for k, v in a.items():
-            if allow_list_keys and k.isdigit() and isinstance(b, list):
-                k = int(k)
-                if len(b) <= k:
-                    raise KeyError(f'Index {k} exceeds the length of list {b}')
-                b[k] = Config._merge_a_into_b(v, b[k], allow_list_keys)
-            elif isinstance(v,
-                            dict) and k in b and not v.pop(DELETE_KEY, False):
-                allowed_types = (dict, list) if allow_list_keys else dict
-                if not isinstance(b[k], allowed_types):
-                    raise TypeError(
-                        f'{k}={v} in child config cannot inherit from base '
-                        f'because {k} is a dict in the child config but is of '
-                        f'type {type(b[k])} in base config. You may set '
-                        f'`{DELETE_KEY}=True` to ignore the base config')
-                b[k] = Config._merge_a_into_b(v, b[k], allow_list_keys)
+    def _merge_a_into_b(a, b, key='', allow_list_keys=False):
+        # merge dict `a` into dict `b` (non-inplace). values in `a` will
+        # overwrite `b`.
+        if b is None:
+            return a
+        if isinstance(a, dict):
+            if isinstance(b, dict):
+                d = b.copy()
+                if a.pop(DELETE_KEY, False):
+                    d.clear()
+                d.update({
+                    k: Config._merge_a_into_b(a[k], b.get(k, None), k)
+                    for k in a
+                })
+                return d
             else:
-                b[k] = v
-        return b
+                raise TypeError(
+                    f'{key}={a} in child config cannot inherit from base '
+                    f'because {key} is a dict in the child config but is of '
+                    f'type {type(b)} in base config. You may set '
+                    f'`{DELETE_KEY}=True` to ignore the base config')
+
+        if isinstance(a, list) and isinstance(b, list) and \
+                len(a) > 0 and a[0] == MERGE_KEY:
+            return [
+                y if x is None else Config._merge_a_into_b(x, y, key + '[]')
+                for x, y in itertools.zip_longest(a[1:], b)
+            ]
+        return a
 
     @staticmethod
     def fromfile(filename,
@@ -473,8 +452,30 @@ class Config:
             d = option_cfg_dict
             key_list = full_key.split('.')
             for subkey in key_list[:-1]:
-                d.setdefault(subkey, ConfigDict())
-                d = d[subkey]
+                if subkey[-1] == ']':
+                    delim_pos = subkey.find('[')
+                    ind = int(subkey[delim_pos + 1:-1])
+                    subd = ConfigDict()
+                    subkey = subkey[:delim_pos]
+                    if subkey in d:
+                        val = d[subkey]
+                        assert type(val) is list, \
+                            'Attempted to list index into dict'
+                        if len(val) < (ind + 2):
+                            d[subkey] = val + [None] * (ind + 1 - len(val)) \
+                                        + [subd]
+                        else:
+                            if d[subkey][ind + 1] is None:
+                                d[subkey][ind + 1] = subd
+                            else:
+                                subd = d[subkey][ind + 1]
+                    else:
+                        val = ['_merge_'] + [None] * ind + [subd]
+                        d[subkey] = val
+                    d = subd
+                else:
+                    d.setdefault(subkey, ConfigDict())
+                    d = d[subkey]
             subkey = key_list[-1]
             d[subkey] = v
 
@@ -504,6 +505,8 @@ class DictAction(Action):
             pass
         if val.lower() in ['true', 'false']:
             return True if val.lower() == 'true' else False
+        if val.lower() == 'none':
+            return None
         return val
 
     def __call__(self, parser, namespace, values, option_string=None):
